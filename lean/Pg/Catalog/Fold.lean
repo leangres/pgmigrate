@@ -148,10 +148,18 @@ def foldCreateDomain (st : TopCreateDomainStmt) (s : FoldState) : FoldState :=
     + per-column attribute rows. Only the relkind differs. -/
 
 /-- Push a relation row and its per-column attribute rows. Returns
-    the updated FoldState. -/
+    the updated FoldState.
+
+    `forceNotNull` overrides each column's per-column `notNull` flag
+    and emits `attnotnull = true`. Composite types use this since
+    postgres treats composite columns as struct fields with implicit
+    NOT NULL; CREATE TABLE leaves each column's flag intact so
+    constraint-driven NOT NULL / PRIMARY KEY logic in the C decoder
+    flows through. -/
 def addRelationWithColumns
     (qualName : QualifiedName) (relkind : RelKind)
-    (columns : List ColumnDefSpec) (s : FoldState) : FoldState :=
+    (columns : List ColumnDefSpec) (forceNotNull : Bool)
+    (s : FoldState) : FoldState :=
   let schema := qualName.schema.getD "public"
   let (nsOid, s') := ensureNamespace schema s
   let (typOid, relOid, s'') := s'.alloc2
@@ -186,7 +194,7 @@ def addRelationWithColumns
           attname   := col.name
           atttypid  := ⟨oid⟩
           attnum    := attnum
-          attnotnull := col.notNull
+          attnotnull := forceNotNull || col.notNull
         }
         (attnum,
          { st with snap :=
@@ -194,14 +202,20 @@ def addRelationWithColumns
       (0, s0)
   finalState
 
-/-- `CREATE TYPE <qualName> AS (<columns>)` — composite type with
-    a relkind=compositeType companion row. -/
+/-- `CREATE TYPE <qualName> AS (<columns>)` — composite type with a
+    relkind=compositeType companion row. Composite columns are
+    implicitly NOT NULL (`forceNotNull := true`), matching what
+    pgpb_to_snapshot.c does. -/
 def foldCompositeType (st : TopCompositeTypeStmt) (s : FoldState) : FoldState :=
-  addRelationWithColumns st.qualName .compositeType st.columns s
+  addRelationWithColumns st.qualName .compositeType st.columns
+    (forceNotNull := true) s
 
-/-- `CREATE TABLE <qualName> (<columns>)` — ordinary-table relkind. -/
+/-- `CREATE TABLE <qualName> (<columns>)` — ordinary-table relkind.
+    Column-level NOT NULL flags flow through unchanged (the C
+    decoder set them from `CONSTR_NOTNULL` / `CONSTR_PRIMARY`). -/
 def foldCreateTable (st : TopCreateStmt) (s : FoldState) : FoldState :=
-  addRelationWithColumns st.qualName .ordinaryTable st.columns s
+  addRelationWithColumns st.qualName .ordinaryTable st.columns
+    (forceNotNull := false) s
 
 /-- `CREATE FUNCTION <qualName>(<params>) RETURNS [SETOF] <returnType>` —
     registers a `PgProc` row. Mirrors what
