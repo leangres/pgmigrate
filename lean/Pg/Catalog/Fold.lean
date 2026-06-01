@@ -92,20 +92,29 @@ def ensureNamespace (name : String) (s : FoldState) : Oid .namespace × FoldStat
   pgpb_to_snapshot.c uses. User-defined types arrive with
   `oidHint = 0`; we walk `snap.types` to find them.
 
-  Returns the OID raw value; the catchall is `2249` (record), the
-  same "unknown type" sentinel pgpb_to_snapshot.c uses. -/
-def resolveType (ref : TypeRef) (s : FoldState) : Nat :=
-  if ref.oidHint ≠ 0 then ref.oidHint
+  `resolveTypeOpt` returns `none` on miss (C's `type_name_to_oid`
+  returning -1). Handlers apply per-context fallbacks:
+    * domain base type           → 0  (Oid.invalid)
+    * composite/table column     → skip the attribute
+    * function argtype           → 2249 (record)
+    * function rettype           → 2278 (void)
+
+  `resolveType` is a sugar wrapper that picks `2249` (record) on
+  miss — used by paths where the per-stmt fallback is also 2249
+  (view-target ColumnRef misses). -/
+def resolveTypeOpt (ref : TypeRef) (s : FoldState) : Option Nat :=
+  if ref.oidHint ≠ 0 then some ref.oidHint
   else
     let target := ref.schema.getD "public"
-    -- Look up the namespace OID for the target schema.
     match s.snap.namespaces.find? (fun n => n.nspname == target) with
     | some ns =>
-      match s.snap.types.find? (fun t =>
-              t.typnamespace == ns.oid && t.typname == ref.name) with
-      | some t => t.oid.raw
-      | none   => 2249
-    | none => 2249
+      (s.snap.types.find? (fun t =>
+              t.typnamespace == ns.oid && t.typname == ref.name))
+        |>.map (·.oid.raw)
+    | none => none
+
+def resolveType (ref : TypeRef) (s : FoldState) : Nat :=
+  (resolveTypeOpt ref s).getD 2249
 
 /-! ### Per-stmt handlers -/
 
@@ -129,11 +138,13 @@ def foldCreateEnum (st : TopCreateEnumStmt) (s : FoldState) : FoldState :=
   { s'' with snap := { s''.snap with types := s''.snap.types ++ [row] } }
 
 /-- `CREATE DOMAIN <qualName> AS <baseType>` — registers a domain
-    type row carrying its base type OID. -/
+    type row carrying its base type OID. Unresolved base types
+    use OID 0 (Oid.invalid), matching the C tool's `base_oid >= 0
+    ? base_oid : 0` fallback. -/
 def foldCreateDomain (st : TopCreateDomainStmt) (s : FoldState) : FoldState :=
   let schema := st.qualName.schema.getD "public"
   let (nsOid, s') := ensureNamespace schema s
-  let baseOid := resolveType st.baseType s'
+  let baseOid := (resolveTypeOpt st.baseType s').getD 0
   let (typOid, s'') := s'.alloc
   let row : PgType := {
     oid          := ⟨typOid⟩
@@ -155,10 +166,21 @@ def foldCreateDomain (st : TopCreateDomainStmt) (s : FoldState) : FoldState :=
     postgres treats composite columns as struct fields with implicit
     NOT NULL; CREATE TABLE leaves each column's flag intact so
     constraint-driven NOT NULL / PRIMARY KEY logic in the C decoder
-    flows through. -/
+    flows through.
+
+    `useSourceIndex` controls how skipped (unresolved-type) columns
+    affect attnum:
+      * `false` (CREATE TABLE) — attnum is a counter that only
+        increments for emitted attributes. Skipped columns leave
+        no gap. Matches `handle_create_table`'s `attnum++` AFTER
+        the type-resolve check.
+      * `true` (CREATE TYPE composite) — attnum is `i + 1` where
+        `i` is the source position. Skipped columns leave a gap.
+        Matches `handle_composite_type`'s `"attnum": i + 1`. -/
 def addRelationWithColumns
     (qualName : QualifiedName) (relkind : RelKind)
     (columns : List ColumnDefSpec) (forceNotNull : Bool)
+    (useSourceIndex : Bool)
     (s : FoldState) : FoldState :=
   let schema := qualName.schema.getD "public"
   let (nsOid, s') := ensureNamespace schema s
@@ -183,39 +205,50 @@ def addRelationWithColumns
     { s''.snap with
         types     := s''.snap.types ++ [typeRow]
         relations := s''.snap.relations ++ [relRow] } }
+  -- Skip columns whose type doesn't resolve, matching the C tool's
+  -- `if (typoid < 0) continue`. attnum source depends on
+  -- `useSourceIndex` (see fn docstring above).
+  let indexed : List (Nat × ColumnDefSpec) :=
+    columns.foldl (fun acc col => acc ++ [(acc.length, col)]) []
   let (_, finalState) :=
-    columns.foldl
-      (fun (acc : Nat × FoldState) col =>
-        let (attnum, st) := acc
-        let attnum := attnum + 1
-        let oid := resolveType col.typeRef st
-        let attr : PgAttribute := {
-          attrelid  := ⟨relOid⟩
-          attname   := col.name
-          atttypid  := ⟨oid⟩
-          attnum    := attnum
-          attnotnull := forceNotNull || col.notNull
-        }
-        (attnum,
-         { st with snap :=
-             { st.snap with attributes := st.snap.attributes ++ [attr] } }))
+    indexed.foldl
+      (fun (acc : Nat × FoldState) (entry : Nat × ColumnDefSpec) =>
+        let (counter, st) := acc
+        let (i, col) := entry
+        match resolveTypeOpt col.typeRef st with
+        | none => (counter, st)
+        | some oid =>
+          let counter := counter + 1
+          let attnum : Int := if useSourceIndex then i + 1 else counter
+          let attr : PgAttribute := {
+            attrelid  := ⟨relOid⟩
+            attname   := col.name
+            atttypid  := ⟨oid⟩
+            attnum    := attnum
+            attnotnull := forceNotNull || col.notNull
+          }
+          (counter,
+           { st with snap :=
+               { st.snap with attributes := st.snap.attributes ++ [attr] } }))
       (0, s0)
   finalState
 
 /-- `CREATE TYPE <qualName> AS (<columns>)` — composite type with a
     relkind=compositeType companion row. Composite columns are
-    implicitly NOT NULL (`forceNotNull := true`), matching what
+    implicitly NOT NULL (`forceNotNull := true`); attnum is source
+    index (skipped columns leave gaps), matching what
     pgpb_to_snapshot.c does. -/
 def foldCompositeType (st : TopCompositeTypeStmt) (s : FoldState) : FoldState :=
   addRelationWithColumns st.qualName .compositeType st.columns
-    (forceNotNull := true) s
+    (forceNotNull := true) (useSourceIndex := true) s
 
 /-- `CREATE TABLE <qualName> (<columns>)` — ordinary-table relkind.
     Column-level NOT NULL flags flow through unchanged (the C
-    decoder set them from `CONSTR_NOTNULL` / `CONSTR_PRIMARY`). -/
+    decoder set them from `CONSTR_NOTNULL` / `CONSTR_PRIMARY`).
+    attnum is sequential — skipped columns don't leave gaps. -/
 def foldCreateTable (st : TopCreateStmt) (s : FoldState) : FoldState :=
   addRelationWithColumns st.qualName .ordinaryTable st.columns
-    (forceNotNull := false) s
+    (forceNotNull := false) (useSourceIndex := false) s
 
 /-- `CREATE FUNCTION <qualName>(<params>) RETURNS [SETOF] <returnType>` —
     registers a `PgProc` row. Mirrors what
@@ -232,14 +265,17 @@ def foldCreateFunction (st : TopCreateFunctionStmt) (s : FoldState) : FoldState 
   let (nsOid, s0) := ensureNamespace schema s
 
   -- Resolve every parameter's type against the in-progress snapshot.
-  let argTypes  : List Nat       := st.parameters.map (fun p => resolveType p.typeRef s0)
+  -- Args fall back to 2249 (record) on miss; matches the C tool's
+  -- `t >= 0 ? t : 2249` in handle_create_function.
+  let argTypes  : List Nat       :=
+    st.parameters.map (fun p => (resolveTypeOpt p.typeRef s0).getD 2249)
   let argNames  : List String    := st.parameters.map (·.name)
   let argModes  : List ArgMode   := st.parameters.map (·.mode)
   let hasModes  : Bool := argModes.any (fun m => decide (m ≠ .in_))
 
-  -- Return type — fall back to void (2278) when unresolved.
-  let retOidRaw : Nat := resolveType st.returnType s0
-  let retOid    : Oid .type := ⟨if retOidRaw == 0 then 2278 else retOidRaw⟩
+  -- Return type — fall back to void (2278) when unresolved, matching
+  -- the C tool's `rettype >= 0 ? rettype : 2278`.
+  let retOid : Oid .type := ⟨(resolveTypeOpt st.returnType s0).getD 2278⟩
 
   let (procOid, s1) := s0.alloc
   let row : PgProc := {
@@ -298,24 +334,23 @@ def resolveQualifiedColumn (fromList : List FromEntry)
             a.attrelid == r.oid && a.attname == col)
   pure a.atttypid.raw
 
-/-- Resolve a bare `col` view-target column. Searches every FROM
-    entry's relation for a matching attribute, returning the first
-    hit (postgres's own disambiguation behavior for unqualified
-    references). -/
-def resolveBareColumn (fromList : List FromEntry)
+/-- Resolve a bare `col` view-target column. Walks ALL snapshot
+    relations in registration order and returns the first
+    attribute that matches by name — same algorithm as
+    `pgpb_to_snapshot.c::resolve_column_oid` for the unqualified
+    case.
+
+    Note: the FROM map is intentionally NOT consulted here. The
+    C tool ignores it for bare refs, so we match. This means a
+    column reference like `schema_name` resolves against any
+    relation with that attribute (the first one allocated),
+    even if the SELECT's FROM clause names something else — a
+    quirk of the C tool's resolver that we replicate for
+    byte-equivalence. -/
+def resolveBareColumn (_fromList : List FromEntry)
     (snap : Snapshot)
     (col : String) : Option Nat :=
-  fromList.findSome?
-    (fun fe => Id.run do
-      let some ns := snap.namespaces.find? (fun n => n.nspname == fe.schema)
-        | pure none
-      let some r := snap.relations.find? (fun r =>
-                  r.relnamespace == ns.oid && r.relname == fe.name)
-        | pure none
-      let some a := snap.attributes.find? (fun a =>
-                  a.attrelid == r.oid && a.attname == col)
-        | pure none
-      pure (some a.atttypid.raw))
+  (snap.attributes.find? (fun a => a.attname == col)).map (·.atttypid.raw)
 
 /-- Resolve a single view-target expression → its OID.
 
@@ -404,15 +439,18 @@ def applyAlterCmd (relOid : Oid .relation) (cmd : AlterTableCmd) (s : FoldState)
     : FoldState :=
   match cmd with
   | .addColumn col =>
-    let typid : Nat := resolveType col.typeRef s
-    let attr : PgAttribute := {
-      attrelid  := relOid
-      attname   := col.name
-      atttypid  := ⟨typid⟩
-      attnum    := maxAttnumFor relOid s.snap.attributes + 1
-      attnotnull := col.notNull
-    }
-    { s with snap := { s.snap with attributes := s.snap.attributes ++ [attr] } }
+    -- Same skip-on-miss as composite/table column emit.
+    match resolveTypeOpt col.typeRef s with
+    | none => s
+    | some typid =>
+      let attr : PgAttribute := {
+        attrelid  := relOid
+        attname   := col.name
+        atttypid  := ⟨typid⟩
+        attnum    := maxAttnumFor relOid s.snap.attributes + 1
+        attnotnull := col.notNull
+      }
+      { s with snap := { s.snap with attributes := s.snap.attributes ++ [attr] } }
   | .dropColumn name =>
     let attrs' := s.snap.attributes.filter
       (fun a => !(a.attrelid == relOid && a.attname == name))
