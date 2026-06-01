@@ -45,8 +45,14 @@ inside a small `FoldState` record so the kernel-side proof
 discipline matches the C tool's `Snapshot.next_oid`. -/
 
 structure FoldState where
-  snap    : Snapshot
-  nextOid : Nat := 16384
+  snap       : Snapshot
+  nextOid    : Nat := 16384
+  /-- Enum labels by type OID — populated by `foldCreateEnum`. The
+      C tool emits these as a sibling `def enumLabels` alongside
+      `def snapshot` (downstream `catalogFromSnapshotWithEnums`
+      consumes both); the Lean fold tracks them here for the same
+      drop-in shape. -/
+  enumLabels : List (Oid .type × List String) := []
 
 namespace FoldState
 
@@ -124,7 +130,8 @@ def foldCreateSchema (st : TopCreateSchemaStmt) (s : FoldState) : FoldState :=
   s'
 
 /-- `CREATE TYPE <qualName> AS ENUM (<labels>)` — registers an enum
-    type row. Schema defaults to "public" when unqualified. -/
+    type row and tracks its labels for the sibling `enumLabels`
+    emit. Schema defaults to "public" when unqualified. -/
 def foldCreateEnum (st : TopCreateEnumStmt) (s : FoldState) : FoldState :=
   let schema := st.qualName.schema.getD "public"
   let (nsOid, s') := ensureNamespace schema s
@@ -135,7 +142,9 @@ def foldCreateEnum (st : TopCreateEnumStmt) (s : FoldState) : FoldState :=
     typnamespace := nsOid
     typtype      := .enum
   }
-  { s'' with snap := { s''.snap with types := s''.snap.types ++ [row] } }
+  { s'' with
+    snap       := { s''.snap with types := s''.snap.types ++ [row] }
+    enumLabels := s''.enumLabels ++ [(⟨typOid⟩, st.labels)] }
 
 /-- `CREATE DOMAIN <qualName> AS <baseType>` — registers a domain
     type row carrying its base type OID. Unresolved base types
@@ -588,5 +597,15 @@ def Snapshot.augmentBuiltins (s : Snapshot) : Snapshot :=
     counterpart of `pgpb_to_snapshot.c`'s output. -/
 def Snapshot.ofTopParseResultAugmented (pr : TopParseResult) : Snapshot :=
   (Snapshot.ofTopParseResult pr).augmentBuiltins
+
+/-- Fold + augment + return both the Snapshot and the enum-labels
+    sibling table. Used by the lean_emit pipeline that replaces
+    `pgpb_to_snapshot.c` — downstream consumers
+    (`catalogFromSnapshotWithEnums`) need both. -/
+def Snapshot.ofTopParseResultAugmentedWithEnums (pr : TopParseResult)
+    : Snapshot × List (Oid .type × List String) :=
+  let final := pr.stmts.foldl
+    (fun s rs => foldTopStmt rs.stmt s) FoldState.empty
+  (final.snap.augmentBuiltins, final.enumLabels)
 
 end Pg.Catalog
