@@ -245,6 +245,124 @@ def foldCreateFunction (st : TopCreateFunctionStmt) (s : FoldState) : FoldState 
 
 /-! ### Top-level dispatch -/
 
+/-! ### View
+
+  CREATE VIEW lands a view-kind relation plus per-column attribute
+  rows. Column types are inferred from each ResTarget — same logic
+  pgpb_to_snapshot.c runs in `handle_view_stmt`:
+
+    * Look up each ColumnRef's table alias in the SELECT's
+      FROM-clause map, find the underlying relation, find the
+      column's atttypid.
+    * Bare column refs (no alias) search all FROM relations
+      (first match wins).
+    * Anything that isn't a ColumnRef → OID 2249 (record).
+
+  Phase 4 ships the same encoding the C tool does; Phase 6's
+  byte-equivalence diff covers the agreement. -/
+
+/-- For a known table alias, find the (schema, relname) it resolves
+    to in the SELECT's FROM map. -/
+def fromMapLookup (fromList : List FromEntry) (alias : String)
+    : Option FromEntry :=
+  fromList.find? (fun fe => fe.alias == alias)
+
+/-- Resolve a `tbl.col` (qualified) view-target column → its
+    underlying attribute's atttypid.
+
+    Returns `none` if the table alias doesn't appear in the FROM
+    map, or if the named column doesn't exist on that relation.
+    The fold uses `none` → OID 2249 (z.unknown) downstream. -/
+def resolveQualifiedColumn (fromList : List FromEntry)
+    (snap : Snapshot)
+    (table : String) (col : String) : Option Nat := do
+  let fe ← fromMapLookup fromList table
+  let ns ← snap.namespaces.find? (fun n => n.nspname == fe.schema)
+  let r  ← snap.relations.find? (fun r =>
+            r.relnamespace == ns.oid && r.relname == fe.name)
+  let a  ← snap.attributes.find? (fun a =>
+            a.attrelid == r.oid && a.attname == col)
+  pure a.atttypid.raw
+
+/-- Resolve a bare `col` view-target column. Searches every FROM
+    entry's relation for a matching attribute, returning the first
+    hit (postgres's own disambiguation behavior for unqualified
+    references). -/
+def resolveBareColumn (fromList : List FromEntry)
+    (snap : Snapshot)
+    (col : String) : Option Nat :=
+  fromList.findSome?
+    (fun fe => Id.run do
+      let some ns := snap.namespaces.find? (fun n => n.nspname == fe.schema)
+        | pure none
+      let some r := snap.relations.find? (fun r =>
+                  r.relnamespace == ns.oid && r.relname == fe.name)
+        | pure none
+      let some a := snap.attributes.find? (fun a =>
+                  a.attrelid == r.oid && a.attname == col)
+        | pure none
+      pure (some a.atttypid.raw))
+
+/-- Resolve a single view-target expression → its OID.
+
+    Phase 4 only types ColumnRefs; anything else (function calls,
+    CASE, casts, arithmetic) collapses to 2249. That gives the
+    downstream codegen `z.unknown()` for that column — same
+    behavior as `pgpb_to_snapshot.c` post-0.5.5. -/
+def resolveViewTarget (fromList : List FromEntry) (snap : Snapshot)
+    : ViewTargetExpr → Nat
+  | .columnRef (some t) col =>
+      (resolveQualifiedColumn fromList snap t col).getD 2249
+  | .columnRef none col =>
+      (resolveBareColumn fromList snap col).getD 2249
+  | .unknownExpr => 2249
+
+/-- `CREATE VIEW <qualName> AS SELECT ... FROM ...` — emits a
+    composite type + view-kind relation + one attribute per
+    target column with its inferred OID. -/
+def foldViewStmt (st : TopViewStmt) (s : FoldState) : FoldState :=
+  let schema := st.qualName.schema.getD "public"
+  let (nsOid, s0) := ensureNamespace schema s
+  let (typOid, relOid, s1) := s0.alloc2
+  let typeRow : PgType := {
+    oid          := ⟨typOid⟩
+    typname      := st.qualName.name
+    typnamespace := nsOid
+    typtype      := .composite
+    typrelid     := ⟨relOid⟩
+  }
+  let relRow : PgClass := {
+    oid          := ⟨relOid⟩
+    relname      := st.qualName.name
+    relnamespace := nsOid
+    relkind      := .view
+    reltype      := ⟨typOid⟩
+  }
+  let s2 : FoldState := { s1 with snap :=
+    { s1.snap with
+        types     := s1.snap.types ++ [typeRow]
+        relations := s1.snap.relations ++ [relRow] } }
+  -- Resolve and append one attribute per target. The FROM map and
+  -- snapshot are read-only during the per-target walk.
+  let (_, finalState) :=
+    st.targets.foldl
+      (fun (acc : Int × FoldState) tgt =>
+        let (attnum, st') := acc
+        let attnum := attnum + 1
+        let oid := resolveViewTarget st.fromList st'.snap tgt.expr
+        let attr : PgAttribute := {
+          attrelid  := ⟨relOid⟩
+          attname   := tgt.outputName
+          atttypid  := ⟨oid⟩
+          attnum    := attnum
+          attnotnull := false   -- views project nullable-by-default
+        }
+        (attnum,
+         { st' with snap :=
+             { st'.snap with attributes := st'.snap.attributes ++ [attr] } }))
+      ((0 : Int), s2)
+  finalState
+
 /-! ### AlterTable
 
   Mutates the in-progress snapshot. Looks up the target relation by
@@ -312,6 +430,7 @@ def foldTopStmt : TopStmt → FoldState → FoldState
   | .compositeTypeStmt  st, s => foldCompositeType  st s
   | .createStmt         st, s => foldCreateTable    st s
   | .createFunctionStmt st, s => foldCreateFunction st s
+  | .viewStmt           st, s => foldViewStmt       st s
   | .alterTableStmt     st, s => foldAlterTable     st s
   | .other _,               s => s  -- catchall — fold leaves snapshot unchanged
 

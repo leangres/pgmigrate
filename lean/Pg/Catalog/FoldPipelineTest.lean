@@ -13,7 +13,7 @@ The pipeline:
   snapshot value
       ↓ native_decide assertions below
 
-The smoke fixture has 7 stmts:
+The smoke fixture has 8 stmts:
   CREATE SCHEMA test_smoke;
   CREATE DOMAIN test_smoke.identifier AS TEXT CHECK ...;
   CREATE TYPE test_smoke.point AS (x INTEGER, y INTEGER);
@@ -21,6 +21,7 @@ The smoke fixture has 7 stmts:
   CREATE FUNCTION test_smoke.distance(p_a point, p_b point) RETURNS double precision;
   ALTER TABLE test_smoke.locations ADD COLUMN created_at TIMESTAMPTZ NOT NULL;
   ALTER TABLE test_smoke.locations ALTER COLUMN name DROP NOT NULL;
+  CREATE VIEW test_smoke.location_summary AS SELECT l.id, name, EXTRACT(...) AS epoch FROM test_smoke.locations l;
 
 Phase 0 fold handles `CreateSchemaStmt` and `CreateEnumStmt` only;
 `CreateDomainStmt`, `CompositeTypeStmt`, `CreateStmt` collapse to
@@ -45,8 +46,8 @@ open Pg.Catalog SmokeFixtureTyped
 
 def folded : Snapshot := Snapshot.ofTopParseResult parseResult
 
-/-- The decoder saw 7 stmts; Phases 0-3 + 5 cover all of them. -/
-example : (parseResult.stmts.length) = 7 := by native_decide
+/-- The decoder saw 8 stmts; Phases 0-5 cover all of them. -/
+example : (parseResult.stmts.length) = 8 := by native_decide
 
 /-- pg_catalog + public + test_smoke. -/
 example : folded.namespaces.length = 3 := by native_decide
@@ -55,20 +56,25 @@ example : folded.namespaces.length = 3 := by native_decide
 example : (folded.namespaces.find? (fun n => n.nspname == "test_smoke")).isSome := by
   native_decide
 
-/-- Phase 1+2 lifts CreateDomain + CompositeType + CreateStmt into
-    typed dispatch. The fixture has one of each, so the snapshot
-    gains:
-      * 3 types  — `test_smoke.identifier` (domain),
-                   `test_smoke.point` (composite),
-                   `test_smoke.locations` (table's implicit composite)
-      * 2 relations — `point` (compositeType) and `locations` (table)
-      * 5 attributes — `point.x`, `point.y`,
-                       `locations.id`, `locations.name`, `locations.position`. -/
-example : folded.types.length = 3 := by native_decide
+/-- Phase 0-5 cover everything in the fixture. The snapshot gains:
+      * 4 types     — identifier (domain), point (composite),
+                      locations (table's implicit composite),
+                      location_summary (view's implicit composite)
+      * 3 relations — point (compositeType), locations (table),
+                      location_summary (view)
+      * 9 attributes — 2 from point + 4 from locations (after
+                      ADD COLUMN created_at) + 3 from the view.
+      * 1 proc — distance. -/
+example : folded.types.length = 4 := by native_decide
 
-example : folded.relations.length = 2 := by native_decide
+/-- 3 relations: point composite + locations table + location_summary view. -/
+example : folded.relations.length = 3 := by native_decide
 
-example : folded.attributes.length = 6 := by native_decide  -- 2 from point + 4 from locations after ADD COLUMN
+/-- 9 attributes:
+      point.x, point.y                                                (2)
+      locations.id, .name, .position, .created_at                     (4)
+      location_summary.id, .name, .epoch                              (3) -/
+example : folded.attributes.length = 9 := by native_decide
 
 /-- `identifier` is a domain over `text` (OID 25, builtin). The
     decoder filled the OID hint; the fold used it directly. -/
@@ -127,11 +133,8 @@ example :
 /-! ### Phase 5 — AlterTable effects -/
 
 /-- ALTER TABLE ... ADD COLUMN created_at TIMESTAMPTZ NOT NULL — adds
-    one more attribute row to `locations`. The fixture started with
-    3 columns (id, name, position); now there are 4. -/
-example : folded.attributes.length = 6 := by native_decide  -- 2 from point + 4 from locations
-
-/-- The new column carries `timestamptz` (OID 1184, builtin) + NOT NULL. -/
+    one more attribute row to `locations`. The new column carries
+    `timestamptz` (OID 1184, builtin) + NOT NULL. -/
 example :
     (folded.attributes.find? (fun a => a.attname == "created_at")).map (·.atttypid.raw)
       = some 1184 := by
@@ -147,6 +150,52 @@ example :
 example :
     (folded.attributes.find? (fun a => a.attname == "name")).map (·.attnotnull)
       = some false := by
+  native_decide
+
+/-! ### Phase 4 — ViewStmt type inference
+
+The view projects three columns of distinct expression kinds:
+
+  * `l.id`              — qualified `tbl.col`; resolved via FROM alias `l`
+                          → locations.id → bigint (20).
+  * `name`              — bare column; first-match across FROM relations
+                          → locations.name → identifier (a user domain).
+                          The fold's `resolveBareColumn` walked the snapshot.
+  * `EXTRACT(...) AS epoch` — non-ColumnRef expression; the C decoder
+                          emitted `.unknownExpr`; the fold uses 2249. -/
+
+/-- The view's relation row is registered with `relkind = .view`. -/
+example :
+    (folded.relations.find? (fun r => r.relname == "location_summary")).map (·.relkind)
+      = some .view := by
+  native_decide
+
+/-- `l.id` resolves through the FROM alias `l → test_smoke.locations`. -/
+example :
+    let viewRel := (folded.relations.find? (fun r => r.relname == "location_summary")).map (·.oid)
+    let idAttr  := folded.attributes.find?
+                    (fun a => viewRel.any (· == a.attrelid) && a.attname == "id")
+    idAttr.map (·.atttypid.raw) = some 20 := by
+  native_decide
+
+/-- Bare `name` reference — fold's `resolveBareColumn` finds it in
+    the single FROM relation and pulls its identifier-domain type. -/
+example :
+    let identifierOid :=
+      (folded.types.find? (fun t => t.typname == "identifier")).map (·.oid.raw)
+    let viewRel := (folded.relations.find? (fun r => r.relname == "location_summary")).map (·.oid)
+    let nameAttr := folded.attributes.find?
+                    (fun a => viewRel.any (· == a.attrelid) && a.attname == "name")
+    nameAttr.map (·.atttypid.raw) = identifierOid ∧ identifierOid.isSome := by
+  native_decide
+
+/-- `EXTRACT(...) AS epoch` — non-ColumnRef expression collapses to
+    the unknown sentinel 2249 (record). -/
+example :
+    let viewRel := (folded.relations.find? (fun r => r.relname == "location_summary")).map (·.oid)
+    let epochAttr := folded.attributes.find?
+                    (fun a => viewRel.any (· == a.attrelid) && a.attname == "epoch")
+    epochAttr.map (·.atttypid.raw) = some 2249 := by
   native_decide
 
 end Pg.Catalog.FoldPipelineTest
