@@ -84,6 +84,29 @@ def ensureNamespace (name : String) (s : FoldState) : Oid .namespace × FoldStat
     let row : PgNamespace := { oid := ⟨oid⟩, nspname := name }
     (row.oid, { s' with snap := { s'.snap with namespaces := s'.snap.namespaces ++ [row] } })
 
+/-! ### Type resolution
+
+  When the C decoder emits a `TypeRef`, the `oidHint` carries the
+  pre-resolved OID for `pg_catalog` builtins (`text=25`, `int8=20`,
+  `bigint=20` alias, …) drawn from the same BUILTIN_TYPES table
+  pgpb_to_snapshot.c uses. User-defined types arrive with
+  `oidHint = 0`; we walk `snap.types` to find them.
+
+  Returns the OID raw value; the catchall is `2249` (record), the
+  same "unknown type" sentinel pgpb_to_snapshot.c uses. -/
+def resolveType (ref : TypeRef) (s : FoldState) : Nat :=
+  if ref.oidHint ≠ 0 then ref.oidHint
+  else
+    let target := ref.schema.getD "public"
+    -- Look up the namespace OID for the target schema.
+    match s.snap.namespaces.find? (fun n => n.nspname == target) with
+    | some ns =>
+      match s.snap.types.find? (fun t =>
+              t.typnamespace == ns.oid && t.typname == ref.name) with
+      | some t => t.oid.raw
+      | none   => 2249
+    | none => 2249
+
 /-! ### Per-stmt handlers -/
 
 /-- `CREATE SCHEMA <name>` — registers a namespace row. -/
@@ -105,12 +128,90 @@ def foldCreateEnum (st : TopCreateEnumStmt) (s : FoldState) : FoldState :=
   }
   { s'' with snap := { s''.snap with types := s''.snap.types ++ [row] } }
 
+/-- `CREATE DOMAIN <qualName> AS <baseType>` — registers a domain
+    type row carrying its base type OID. -/
+def foldCreateDomain (st : TopCreateDomainStmt) (s : FoldState) : FoldState :=
+  let schema := st.qualName.schema.getD "public"
+  let (nsOid, s') := ensureNamespace schema s
+  let baseOid := resolveType st.baseType s'
+  let (typOid, s'') := s'.alloc
+  let row : PgType := {
+    oid          := ⟨typOid⟩
+    typname      := st.qualName.name
+    typnamespace := nsOid
+    typtype      := .domain
+    typbasetype  := ⟨baseOid⟩
+  }
+  { s'' with snap := { s''.snap with types := s''.snap.types ++ [row] } }
+
+/-! ### Composite & table — both register a composite type + relation
+    + per-column attribute rows. Only the relkind differs. -/
+
+/-- Push a relation row and its per-column attribute rows. Returns
+    the updated FoldState. -/
+def addRelationWithColumns
+    (qualName : QualifiedName) (relkind : RelKind)
+    (columns : List ColumnDefSpec) (s : FoldState) : FoldState :=
+  let schema := qualName.schema.getD "public"
+  let (nsOid, s') := ensureNamespace schema s
+  let (typOid, relOid, s'') := s'.alloc2
+  let typeRow : PgType := {
+    oid          := ⟨typOid⟩
+    typname      := qualName.name
+    typnamespace := nsOid
+    typtype      := .composite
+    typrelid     := ⟨relOid⟩
+  }
+  let relRow : PgClass := {
+    oid          := ⟨relOid⟩
+    relname      := qualName.name
+    relnamespace := nsOid
+    relkind      := relkind
+    reltype      := ⟨typOid⟩
+  }
+  -- Add attributes after the relation is staged so resolveType sees
+  -- any earlier-allocated types in the same fold.
+  let s0 : FoldState := { s'' with snap :=
+    { s''.snap with
+        types     := s''.snap.types ++ [typeRow]
+        relations := s''.snap.relations ++ [relRow] } }
+  let (_, finalState) :=
+    columns.foldl
+      (fun (acc : Nat × FoldState) col =>
+        let (attnum, st) := acc
+        let attnum := attnum + 1
+        let oid := resolveType col.typeRef st
+        let attr : PgAttribute := {
+          attrelid  := ⟨relOid⟩
+          attname   := col.name
+          atttypid  := ⟨oid⟩
+          attnum    := attnum
+          attnotnull := col.notNull
+        }
+        (attnum,
+         { st with snap :=
+             { st.snap with attributes := st.snap.attributes ++ [attr] } }))
+      (0, s0)
+  finalState
+
+/-- `CREATE TYPE <qualName> AS (<columns>)` — composite type with
+    a relkind=compositeType companion row. -/
+def foldCompositeType (st : TopCompositeTypeStmt) (s : FoldState) : FoldState :=
+  addRelationWithColumns st.qualName .compositeType st.columns s
+
+/-- `CREATE TABLE <qualName> (<columns>)` — ordinary-table relkind. -/
+def foldCreateTable (st : TopCreateStmt) (s : FoldState) : FoldState :=
+  addRelationWithColumns st.qualName .ordinaryTable st.columns s
+
 /-! ### Top-level dispatch -/
 
 def foldTopStmt : TopStmt → FoldState → FoldState
-  | .createSchemaStmt st, s => foldCreateSchema st s
-  | .createEnumStmt   st, s => foldCreateEnum   st s
-  | .other _,             s => s  -- catchall — fold leaves snapshot unchanged
+  | .createSchemaStmt   st, s => foldCreateSchema  st s
+  | .createEnumStmt     st, s => foldCreateEnum    st s
+  | .createDomainStmt   st, s => foldCreateDomain  st s
+  | .compositeTypeStmt  st, s => foldCompositeType st s
+  | .createStmt         st, s => foldCreateTable   st s
+  | .other _,               s => s  -- catchall — fold leaves snapshot unchanged
 
 /-- Fold an entire `TopParseResult` over the seeded empty state.
     The resulting `Snapshot` is the kernel-checked catalog. -/

@@ -52,11 +52,47 @@ example : folded.namespaces.length = 3 := by native_decide
 example : (folded.namespaces.find? (fun n => n.nspname == "test_smoke")).isSome := by
   native_decide
 
-/-- Phase 0 doesn't handle CompositeTypeStmt/CreateDomainStmt/CreateStmt
-    yet — they collapse to `.other` and don't add type rows. As the
-    fold's coverage grows, this number rises. -/
-example : folded.types.length = 0 := by native_decide
+/-- Phase 1+2 lifts CreateDomain + CompositeType + CreateStmt into
+    typed dispatch. The fixture has one of each, so the snapshot
+    gains:
+      * 3 types  — `test_smoke.identifier` (domain),
+                   `test_smoke.point` (composite),
+                   `test_smoke.locations` (table's implicit composite)
+      * 2 relations — `point` (compositeType) and `locations` (table)
+      * 5 attributes — `point.x`, `point.y`,
+                       `locations.id`, `locations.name`, `locations.position`. -/
+example : folded.types.length = 3 := by native_decide
 
-example : folded.relations.length = 0 := by native_decide
+example : folded.relations.length = 2 := by native_decide
+
+example : folded.attributes.length = 5 := by native_decide
+
+/-- `identifier` is a domain over `text` (OID 25, builtin). The
+    decoder filled the OID hint; the fold used it directly. -/
+example :
+    (folded.types.find? (fun t => t.typname == "identifier")).map (·.typbasetype.raw)
+      = some 25 := by
+  native_decide
+
+/-- `locations.id` is `BIGINT PRIMARY KEY` — typed as int8 (20) +
+    NOT NULL inferred from the PRIMARY KEY constraint. -/
+example :
+    (folded.attributes.find? (fun a => a.attname == "id")).map (·.atttypid.raw)
+      = some 20 := by
+  native_decide
+
+example :
+    (folded.attributes.find? (fun a => a.attname == "id")).map (·.attnotnull)
+      = some true := by
+  native_decide
+
+/-- `locations.position` references the user-defined `test_smoke.point`
+    composite type. The OID hint was 0 (not a builtin); the Lean
+    fold's `resolveType` walked `snap.types` and found it. -/
+example :
+    let pointOid := (folded.types.find? (fun t => t.typname == "point")).map (·.oid.raw)
+    let posOid   := (folded.attributes.find? (fun a => a.attname == "position")).map (·.atttypid.raw)
+    pointOid = posOid ∧ pointOid.isSome := by
+  native_decide
 
 end Pg.Catalog.FoldPipelineTest
