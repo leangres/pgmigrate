@@ -449,8 +449,106 @@ def foldTopStmt : TopStmt → FoldState → FoldState
   | .other _,               s => s  -- catchall — fold leaves snapshot unchanged
 
 /-- Fold an entire `TopParseResult` over the seeded empty state.
-    The resulting `Snapshot` is the kernel-checked catalog. -/
+    The resulting `Snapshot` is the kernel-checked catalog without
+    referenced-builtin augmentation — i.e. `snap.types` carries only
+    the user-allocated rows the fold itself added.
+
+    For byte-equivalence with `pgpb_to_snapshot.c` (which prepends
+    referenced `pg_catalog` builtin rows to its emit), compose with
+    `Snapshot.augmentBuiltins` (or call `ofTopParseResultAugmented`
+    below). -/
 def Snapshot.ofTopParseResult (pr : TopParseResult) : Snapshot :=
   (pr.stmts.foldl (fun s rs => foldTopStmt rs.stmt s) FoldState.empty).snap
+
+/-! ### Builtins augmentation
+
+  Phase 7 mirrors `pgpb_to_snapshot.c::emit_referenced_builtins`:
+  scan the snapshot for OIDs referenced from user rows, filter to
+  the BUILTIN_TYPES table, dedup + sort, prepend `PgType` rows to
+  `snap.types`. After this pass, the Lean fold's emitted `Snapshot`
+  byte-matches the C tool's for every catalog table. -/
+
+/-- Mirror of `pgpb_to_snapshot.c::BUILTIN_TYPES`. The ORDER inside
+    matters: lookup-by-OID returns the FIRST match (so `oid := 20`
+    resolves to `"int8"`, not `"bigint"`), exactly mirroring
+    `builtin_name_for_oid`. -/
+def builtinTable : List (String × Nat × Bool) :=
+  -- (typname, OID, isPseudo)
+  [ ("bool", 16, false), ("bytea", 17, false), ("char", 18, false), ("name", 19, false),
+    ("int8", 20, false), ("bigint", 20, false),
+    ("int2", 21, false), ("smallint", 21, false),
+    ("int4", 23, false), ("integer", 23, false), ("int", 23, false),
+    ("text", 25, false), ("oid", 26, false),
+    ("float4", 700, false), ("real", 700, false),
+    ("float8", 701, false), ("double", 701, false), ("double_precision", 701, false),
+    ("numeric", 1700, false), ("decimal", 1700, false),
+    ("varchar", 1043, false), ("bpchar", 1042, false),
+    ("uuid", 2950, false),
+    ("date", 1082, false),
+    ("time", 1083, false), ("timetz", 1266, false),
+    ("timestamp", 1114, false), ("timestamptz", 1184, false),
+    ("interval", 1186, false),
+    ("json", 114, false), ("jsonb", 3802, false),
+    ("void", 2278, true),  ("record", 2249, true),
+    ("_int8", 1016, false), ("_int4", 1007, false),
+    ("_text", 1009, false), ("_bool", 1000, false),
+    ("regclass", 2205, false), ("regproc", 24, false),
+    ("regprocedure", 2202, false),
+    ("regoper", 2203, false), ("regoperator", 2204, false),
+    ("regtype", 2206, false),
+    ("regrole", 4096, false), ("regnamespace", 4089, false)
+  ]
+
+def builtinNameOf (oid : Nat) : Option String :=
+  builtinTable.findSome? (fun (n, o, _) => if o == oid then some n else none)
+
+def builtinIsPseudo (oid : Nat) : Bool :=
+  builtinTable.any (fun (_, o, p) => o == oid && p)
+
+/-- Insert `x` into a sorted-ascending list, preserving order. -/
+def insertSorted (x : Nat) : List Nat → List Nat
+  | []         => [x]
+  | h :: t     => if x ≤ h then x :: h :: t else h :: insertSorted x t
+
+/-- Sort + dedupe a list of Nat ascending. Used for the
+    referenced-builtin OID set; sizes are small (≤64), so the
+    O(n²) insertion-sort cost is irrelevant. -/
+def sortDedupAsc (l : List Nat) : List Nat :=
+  l.foldr (fun x acc => if acc.contains x then acc else insertSorted x acc) []
+
+/-- All OIDs referenced by the snapshot's user rows that exist in
+    the `BUILTIN_TYPES` table. Mirrors the C tool's collection
+    walk: types' typbasetype + live attributes' atttypid + procs'
+    prorettype + procs' proargtypes. -/
+def Snapshot.referencedBuiltinOids (s : Snapshot) : List Nat :=
+  let typeOids   := s.types.map (·.typbasetype.raw)
+  let attrOids   := (s.attributes.filter (fun a => a.attrelid.raw ≠ 0))
+                      |>.map (·.atttypid.raw)
+  let procRetOids := s.procs.map (·.prorettype.raw)
+  let procArgOids := s.procs.foldl
+                      (fun acc p => acc ++ p.proargtypes.map (·.raw)) []
+  let all := typeOids ++ attrOids ++ procRetOids ++ procArgOids
+  let builtins := all.filter (fun o => (builtinNameOf o).isSome)
+  sortDedupAsc builtins
+
+/-- Prepend `PgType` rows for every referenced builtin to
+    `snap.types`. The new rows carry `typnamespace = ⟨11⟩`
+    (pg_catalog) and `typtype = .pseudo` for `void`/`record`, else
+    `.base` — matching the C tool's emit semantics exactly. -/
+def Snapshot.augmentBuiltins (s : Snapshot) : Snapshot :=
+  let oids := s.referencedBuiltinOids
+  let rows : List PgType := oids.filterMap (fun oid =>
+    (builtinNameOf oid).map (fun name => {
+      oid          := ⟨oid⟩
+      typname      := name
+      typnamespace := ⟨11⟩
+      typtype      := if builtinIsPseudo oid then .pseudo else .base
+    }))
+  { s with types := rows ++ s.types }
+
+/-- Fold + augment in one step. This is the byte-equivalent
+    counterpart of `pgpb_to_snapshot.c`'s output. -/
+def Snapshot.ofTopParseResultAugmented (pr : TopParseResult) : Snapshot :=
+  (Snapshot.ofTopParseResult pr).augmentBuiltins
 
 end Pg.Catalog
