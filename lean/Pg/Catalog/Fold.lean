@@ -203,14 +203,116 @@ def foldCompositeType (st : TopCompositeTypeStmt) (s : FoldState) : FoldState :=
 def foldCreateTable (st : TopCreateStmt) (s : FoldState) : FoldState :=
   addRelationWithColumns st.qualName .ordinaryTable st.columns s
 
+/-- `CREATE FUNCTION <qualName>(<params>) RETURNS [SETOF] <returnType>` —
+    registers a `PgProc` row. Mirrors what
+    `pgpb_to_snapshot.c::handle_create_function` does:
+
+      * Resolve each parameter's typeRef → OID.
+      * Resolve the return type → OID (falls back to 2278 = void).
+      * Collect names / modes / types separately (preserving order).
+      * `proargmodes` is emitted only if any mode is non-default,
+        matching the C tool's `has_modes` branch and savvi-studio's
+        on-disk PgProc representation (empty list means "all IN"). -/
+def foldCreateFunction (st : TopCreateFunctionStmt) (s : FoldState) : FoldState :=
+  let schema := st.qualName.schema.getD "public"
+  let (nsOid, s0) := ensureNamespace schema s
+
+  -- Resolve every parameter's type against the in-progress snapshot.
+  let argTypes  : List Nat       := st.parameters.map (fun p => resolveType p.typeRef s0)
+  let argNames  : List String    := st.parameters.map (·.name)
+  let argModes  : List ArgMode   := st.parameters.map (·.mode)
+  let hasModes  : Bool := argModes.any (fun m => decide (m ≠ .in_))
+
+  -- Return type — fall back to void (2278) when unresolved.
+  let retOidRaw : Nat := resolveType st.returnType s0
+  let retOid    : Oid .type := ⟨if retOidRaw == 0 then 2278 else retOidRaw⟩
+
+  let (procOid, s1) := s0.alloc
+  let row : PgProc := {
+    oid          := ⟨procOid⟩
+    proname      := st.qualName.name
+    pronamespace := nsOid
+    prokind      := .function
+    prosecdef    := false
+    provolatile  := .stable
+    prorettype   := retOid
+    proargtypes  := argTypes.map (fun n => ⟨n⟩)
+    proargnames  := argNames
+    proretset    := st.returnSetof
+    proargmodes  := if hasModes then argModes else []
+  }
+  { s1 with snap := { s1.snap with procs := s1.snap.procs ++ [row] } }
+
+/-! ### Top-level dispatch -/
+
+/-! ### AlterTable
+
+  Mutates the in-progress snapshot. Looks up the target relation by
+  (schema, name) — same as `pgpb_to_snapshot.c::find_relation_by_name` —
+  then dispatches each cmd. Drops and not-null flips happen by
+  rewriting `snap.attributes`; add-column appends a new attribute
+  row with the next attnum.
+
+  Unsupported AlterTableCmd subtypes (ADD CONSTRAINT, RENAME, OWNER,
+  …) arrive as `.skip` from the C decoder; the fold treats them as
+  no-ops. -/
+def findRelByQual (qn : QualifiedName) (snap : Snapshot)
+    : Option (Oid .relation) := do
+  let target := qn.schema.getD "public"
+  let ns ← snap.namespaces.find? (fun n => n.nspname == target)
+  let r  ← snap.relations.find? (fun r => r.relnamespace == ns.oid && r.relname == qn.name)
+  pure r.oid
+
+def maxAttnumFor (relOid : Oid .relation) (attrs : List PgAttribute) : Int :=
+  attrs.foldl
+    (fun acc a => if a.attrelid == relOid && a.attnum > acc then a.attnum else acc)
+    (0 : Int)
+
+def applyAlterCmd (relOid : Oid .relation) (cmd : AlterTableCmd) (s : FoldState)
+    : FoldState :=
+  match cmd with
+  | .addColumn col =>
+    let typid : Nat := resolveType col.typeRef s
+    let attr : PgAttribute := {
+      attrelid  := relOid
+      attname   := col.name
+      atttypid  := ⟨typid⟩
+      attnum    := maxAttnumFor relOid s.snap.attributes + 1
+      attnotnull := col.notNull
+    }
+    { s with snap := { s.snap with attributes := s.snap.attributes ++ [attr] } }
+  | .dropColumn name =>
+    let attrs' := s.snap.attributes.filter
+      (fun a => !(a.attrelid == relOid && a.attname == name))
+    { s with snap := { s.snap with attributes := attrs' } }
+  | .setNotNull name =>
+    let attrs' := s.snap.attributes.map
+      (fun a => if a.attrelid == relOid && a.attname == name
+                then { a with attnotnull := true } else a)
+    { s with snap := { s.snap with attributes := attrs' } }
+  | .dropNotNull name =>
+    let attrs' := s.snap.attributes.map
+      (fun a => if a.attrelid == relOid && a.attname == name
+                then { a with attnotnull := false } else a)
+    { s with snap := { s.snap with attributes := attrs' } }
+  | .skip => s
+
+def foldAlterTable (st : TopAlterTableStmt) (s : FoldState) : FoldState :=
+  match findRelByQual st.qualName s.snap with
+  | none => s   -- target table not in snapshot — silently skip (mirrors C tool)
+  | some relOid =>
+    st.cmds.foldl (fun acc cmd => applyAlterCmd relOid cmd acc) s
+
 /-! ### Top-level dispatch -/
 
 def foldTopStmt : TopStmt → FoldState → FoldState
-  | .createSchemaStmt   st, s => foldCreateSchema  st s
-  | .createEnumStmt     st, s => foldCreateEnum    st s
-  | .createDomainStmt   st, s => foldCreateDomain  st s
-  | .compositeTypeStmt  st, s => foldCompositeType st s
-  | .createStmt         st, s => foldCreateTable   st s
+  | .createSchemaStmt   st, s => foldCreateSchema   st s
+  | .createEnumStmt     st, s => foldCreateEnum     st s
+  | .createDomainStmt   st, s => foldCreateDomain   st s
+  | .compositeTypeStmt  st, s => foldCompositeType  st s
+  | .createStmt         st, s => foldCreateTable    st s
+  | .createFunctionStmt st, s => foldCreateFunction st s
+  | .alterTableStmt     st, s => foldAlterTable     st s
   | .other _,               s => s  -- catchall — fold leaves snapshot unchanged
 
 /-- Fold an entire `TopParseResult` over the seeded empty state.

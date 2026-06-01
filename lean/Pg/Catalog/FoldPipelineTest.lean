@@ -13,11 +13,14 @@ The pipeline:
   snapshot value
       ↓ native_decide assertions below
 
-The smoke fixture has 4 stmts:
+The smoke fixture has 7 stmts:
   CREATE SCHEMA test_smoke;
   CREATE DOMAIN test_smoke.identifier AS TEXT CHECK ...;
   CREATE TYPE test_smoke.point AS (x INTEGER, y INTEGER);
   CREATE TABLE test_smoke.locations (...);
+  CREATE FUNCTION test_smoke.distance(p_a point, p_b point) RETURNS double precision;
+  ALTER TABLE test_smoke.locations ADD COLUMN created_at TIMESTAMPTZ NOT NULL;
+  ALTER TABLE test_smoke.locations ALTER COLUMN name DROP NOT NULL;
 
 Phase 0 fold handles `CreateSchemaStmt` and `CreateEnumStmt` only;
 `CreateDomainStmt`, `CompositeTypeStmt`, `CreateStmt` collapse to
@@ -42,8 +45,8 @@ open Pg.Catalog SmokeFixtureTyped
 
 def folded : Snapshot := Snapshot.ofTopParseResult parseResult
 
-/-- The decoder saw 4 stmts; one of them (CREATE SCHEMA) is folded. -/
-example : (parseResult.stmts.length) = 4 := by native_decide
+/-- The decoder saw 7 stmts; Phases 0-3 + 5 cover all of them. -/
+example : (parseResult.stmts.length) = 7 := by native_decide
 
 /-- pg_catalog + public + test_smoke. -/
 example : folded.namespaces.length = 3 := by native_decide
@@ -65,7 +68,7 @@ example : folded.types.length = 3 := by native_decide
 
 example : folded.relations.length = 2 := by native_decide
 
-example : folded.attributes.length = 5 := by native_decide
+example : folded.attributes.length = 6 := by native_decide  -- 2 from point + 4 from locations after ADD COLUMN
 
 /-- `identifier` is a domain over `text` (OID 25, builtin). The
     decoder filled the OID hint; the fold used it directly. -/
@@ -93,6 +96,57 @@ example :
     let pointOid := (folded.types.find? (fun t => t.typname == "point")).map (·.oid.raw)
     let posOid   := (folded.attributes.find? (fun a => a.attname == "position")).map (·.atttypid.raw)
     pointOid = posOid ∧ pointOid.isSome := by
+  native_decide
+
+/-- Phase 3: the function row is registered. -/
+example : folded.procs.length = 1 := by native_decide
+
+/-- `distance` returns `DOUBLE PRECISION` (OID 701). The builtin hint
+    was filled by the C decoder. -/
+example :
+    (folded.procs.find? (fun p => p.proname == "distance")).map (·.prorettype.raw)
+      = some 701 := by
+  native_decide
+
+/-- Both parameters are typed as `test_smoke.point` (user type),
+    which the Lean fold resolved via `resolveType` against the
+    snapshot row added two stmts earlier. -/
+example :
+    let pointOid := (folded.types.find? (fun t => t.typname == "point")).map (·.oid.raw)
+    let argTypes := (folded.procs.find? (fun p => p.proname == "distance")).map
+                      (fun p => p.proargtypes.map (·.raw))
+    argTypes = pointOid.map (fun o => [o, o]) := by
+  native_decide
+
+/-- The two argument names round-trip. -/
+example :
+    (folded.procs.find? (fun p => p.proname == "distance")).map (·.proargnames)
+      = some ["p_a", "p_b"] := by
+  native_decide
+
+/-! ### Phase 5 — AlterTable effects -/
+
+/-- ALTER TABLE ... ADD COLUMN created_at TIMESTAMPTZ NOT NULL — adds
+    one more attribute row to `locations`. The fixture started with
+    3 columns (id, name, position); now there are 4. -/
+example : folded.attributes.length = 6 := by native_decide  -- 2 from point + 4 from locations
+
+/-- The new column carries `timestamptz` (OID 1184, builtin) + NOT NULL. -/
+example :
+    (folded.attributes.find? (fun a => a.attname == "created_at")).map (·.atttypid.raw)
+      = some 1184 := by
+  native_decide
+
+example :
+    (folded.attributes.find? (fun a => a.attname == "created_at")).map (·.attnotnull)
+      = some true := by
+  native_decide
+
+/-- ALTER TABLE ... ALTER COLUMN name DROP NOT NULL — flips the
+    `name` column's `attnotnull` from true (from CREATE TABLE) to false. -/
+example :
+    (folded.attributes.find? (fun a => a.attname == "name")).map (·.attnotnull)
+      = some false := by
   native_decide
 
 end Pg.Catalog.FoldPipelineTest
