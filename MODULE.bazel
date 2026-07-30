@@ -28,15 +28,3 @@ register_toolchains(
     "@pgmigrate_lake//:lean_toolchain_def",
     dev_dependency = True,
 )
-
-# TEMPORARY, local verification only — MUST be removed before publishing.
-# The registry's S4 gate rejects a published module carrying any *_override.
-local_path_override(
-    module_name = "pgcatalog",
-    path = "../pgcatalog-carve",
-)
-
-local_path_override(
-    module_name = "pgquery",
-    path = "../pgquery-carve",
-)
