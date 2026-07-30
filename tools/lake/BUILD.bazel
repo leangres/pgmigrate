@@ -1,0 +1,13 @@
+# Lake workspace inputs consumed by `@rules_lean//lean:lake.bzl`'s
+# `lake_workspace` module extension (wired in //:MODULE.bazel).
+#
+# The .lake/ build directory is gitignored; lake_workspace materializes its own
+# copy inside the external repo.
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "lakefile.lean",
+    "lake-manifest.json",
+    "lean-toolchain",
+])

@@ -16,7 +16,7 @@ hand-crafted tests below are sufficient to lock the fold's shape
 in the meantime.
 -/
 
-import Pg.Catalog.Fold
+import Pg.Migrate.Fold
 
 namespace Pg.Catalog.FoldTest
 

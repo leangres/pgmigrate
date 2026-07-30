@@ -1,0 +1,42 @@
+module(
+    name = "pgmigrate",
+    version = "17.6.0",
+)
+
+# Version tracks the Postgres release modelled. A convention, not enforced —
+# `compatibility_level` would have been the mechanism and Bazel 9 made it a no-op.
+# See pgcatalog's MODULE.bazel for the two candidate enforcement mechanisms.
+
+bazel_dep(name = "rules_lean", version = "0.6.1")
+
+# `Fold` folds a parsed DDL stream into a catalog snapshot, so it needs both the
+# catalog model and the parse-tree shapes. This module sits at the top of the
+# leangres graph; everything else is below it.
+bazel_dep(name = "pgcatalog", version = "17.6.1")
+bazel_dep(name = "pgquery", version = "17.6.0")
+
+lake = use_extension("@rules_lean//lean:lake.bzl", "lake")
+lake.workspace(
+    name = "pgmigrate_lake",
+    lake_manifest = "//tools/lake:lake-manifest.json",
+    lakefile = "//tools/lake:lakefile.lean",
+    lean_toolchain = "//tools/lake:lean-toolchain",
+)
+use_repo(lake, "pgmigrate_lake")
+
+register_toolchains(
+    "@pgmigrate_lake//:lean_toolchain_def",
+    dev_dependency = True,
+)
+
+# TEMPORARY, local verification only — MUST be removed before publishing.
+# The registry's S4 gate rejects a published module carrying any *_override.
+local_path_override(
+    module_name = "pgcatalog",
+    path = "../pgcatalog-carve",
+)
+
+local_path_override(
+    module_name = "pgquery",
+    path = "../pgquery-carve",
+)

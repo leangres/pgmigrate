@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Library, published archive, and a consumer taking the COMPILED library via
+  # `deps` — plus the C decoder chain, which is the half of this module that is
+  # not Lean.
+  #
+  # Linux: `lean_olean_archive` before rules_lean 0.6.1 failed only on linux (GNU
+  # tar exits 1 reading through the bazel-out symlink farm; BSD tar warns), so a
+  # darwin-green archive is not evidence for the platform consumers build on.
+  build:
+    name: lean library + olean archive + fold pipeline (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.10.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - run: |
+          bazel test //lean/... --test_output=errors
+          bazel build //lean:pgmigrate_oleans
+      - name: the archive must carry real bytes, not links into bazel-out
+        run: |
+          A=$(bazel cquery --output=files //lean:pgmigrate_oleans 2>/dev/null | tail -1)
+          echo "archive: $A ($(wc -c < "$A") bytes)"
+          # A non-dereferenced archive still has entries at the right paths, so
+          # assert entry TYPE. 'l' in column one is a symlink; any is a failure.
+          if tar tvzf "$A" | grep -q '^l'; then
+            echo "FAIL: archive contains symlinks — not dereferenced" >&2
+            tar tvzf "$A" | grep '^l' >&2
+            exit 1
+          fi
+          n=$(tar tzf "$A" | grep -c '\.olean$')
+          test "$n" -eq 1 || { echo "FAIL: $n oleans, expected 1" >&2; exit 1; }
+          echo "OK: $n oleans, no symlinks"
+
+  buildifier:
+    name: buildifier lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install buildifier
+        run: |
+          curl -fsSL -o /usr/local/bin/buildifier \
+            https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64
+          chmod +x /usr/local/bin/buildifier
+      - run: buildifier --mode=check --lint=warn -r .

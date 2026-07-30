@@ -1,0 +1,10 @@
+common --enable_bzlmod
+
+# registry.tbzl.dev, not the older raw-githubusercontent mirror: the move
+# reformatted every source.json, so a stale pin fails at resolution with
+# "Checksum was X but wanted Y" rather than anything legible.
+common --registry=https://registry.tbzl.dev/
+common --registry=https://bcr.bazel.build/
+
+test --test_output=errors
+test --test_summary=terse

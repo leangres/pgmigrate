@@ -1,0 +1,6 @@
+bazel-*
+.bazelrc.user
+.DS_Store
+.claude/
+MODULE.bazel.lock
+.lake/

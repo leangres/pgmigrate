@@ -37,7 +37,7 @@ As more stmt kinds get pre-decoded in the C tool + handled in
 the fold, these assertions tighten.
 -/
 
-import Pg.Catalog.Fold
+import Pg.Migrate.Fold
 import SmokeFixtureTyped
 
 namespace Pg.Catalog.FoldPipelineTest
