@@ -26,9 +26,13 @@ load("@rules_lean//lean:lean.bzl", "lean_library", "lean_olean_archive", "lean_t
 # decision.
 lean_library(
     name = "pgmigrate",
-    srcs = ["Pg/Migrate/Fold.lean"],
+    srcs = [
+        "Pg/Migrate/Fold.lean",
+        "Pg/Migrate/Step.lean",
+    ],
     visibility = ["//visibility:public"],
     deps = [
+        "@pgast//lean:pgast",
         "@pgcatalog//lean:pgcatalog",
         "@pgquery//lean:pgquery",
     ],
@@ -38,6 +42,16 @@ lean_olean_archive(
     name = "pgmigrate_oleans",
     library = ":pgmigrate",
     visibility = ["//visibility:public"],
+)
+
+# The transition's preconditions — most of these assert a REFUSAL, because a
+# transition that accepts everything is what Fold already is.
+lean_test(
+    name = "step_test",
+    srcs = ["Pg/Migrate/StepTest.lean"],
+    entry = "Pg/Migrate/StepTest.lean",
+    visibility = ["//visibility:public"],
+    deps = [":pgmigrate"],
 )
 
 lean_test(

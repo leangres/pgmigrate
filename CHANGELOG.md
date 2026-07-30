@@ -1,5 +1,65 @@
 # Changelog
 
+## 17.6.1 — a transition that can refuse
+
+`Fold` projects: it folds whatever the parser produced into a catalog, TOTAL,
+never failing. Right for its job — reconstructing a catalog from a schema that
+already exists and already worked.
+
+A migration is the other direction. It has to answer *may this statement run
+against THIS catalog*, and the interesting answers are no.
+
+`Pg.Migrate.step : CatalogState → Stmt → Except CatalogError CatalogState`, with
+`run` over a list reporting **which** statement failed.
+
+### Checking is split from mutation
+
+`elabStmt` decides and returns effects; `applyEffect` is total and just writes.
+Every precondition proof lives in one, every allocation argument in the other,
+and neither reasons about the other. It also means hazard and lock analysis can
+later read the **effect list** rather than re-matching `Stmt` — an effect list
+containing `dropAttribute` is data-lossy by construction.
+
+### It consumes the emitter-side AST
+
+`Fold` takes `Pg.Query.Top.TopStmt` (what Postgres parsed); `step` takes
+`Pg.Stmt.Stmt` (what we are about to emit). Both directions are wanted, which is
+why this module now depends on `pgast` as well.
+
+### What it refuses
+
+ALTER on a missing relation or column; ADD COLUMN or RENAME onto a name already
+taken; VALIDATE or DROP naming a constraint that was never added; re-adding a
+constraint name; `DROP … RESTRICT` while `normal` dependents remain; and a
+foreign key whose referenced columns are not covered by a unique index — the
+check Postgres performs that a schema-shape predicate cannot.
+
+`IF NOT EXISTS` / `IF EXISTS` make the corresponding statement a no-op rather
+than an error, which is what a re-runnable migration depends on.
+
+### `NOT VALID` round-trips
+
+`ADD CONSTRAINT … NOT VALID` leaves `convalidated := false`; `VALIDATE
+CONSTRAINT` flips it. That is the sequence an online migration is built from, and
+it is now expressible end to end: `pgast` emits it, `pgcatalog` models it,
+`step` transitions it.
+
+### Unmodelled statements ERROR
+
+`setDefault`, `setColumnType`, `renameTable`, `setSchema` and most `DROP` kinds
+return `.unsupported` rather than succeeding quietly. A migration "proved"
+against a transition that silently ignored half its statements would be worse
+than no proof.
+
+### `Fold` is untouched
+
+It keeps its byte-equivalence claim over a 1,384-statement production schema, and
+deliberately keeps the quirks `step` rejects. Where the two disagree on a schema
+both accept, that is a **finding to triage** — quite possibly a real defect in
+the schema — not a bug in either.
+
+15 pins in `Pg/Migrate/StepTest.lean`; 3/3 targets pass.
+
 ## 17.6.0 — the migration layer, opened
 
 `Pg.Catalog.Fold` extracted from `tomato-bazel/rules_postgres` with

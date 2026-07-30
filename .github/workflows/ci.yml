@@ -39,9 +39,16 @@ jobs:
             tar tvzf "$A" | grep '^l' >&2
             exit 1
           fi
+          # Derived from srcs, not hardcoded: a literal count fails on every
+          # legitimate module addition, which trains people to edit the check.
+          want=$(bazel query 'labels(srcs, //lean:pgmigrate)' 2>/dev/null | grep -c '\.lean$')
           n=$(tar tzf "$A" | grep -c '\.olean$')
-          test "$n" -eq 1 || { echo "FAIL: $n oleans, expected 1" >&2; exit 1; }
-          echo "OK: $n oleans, no symlinks"
+          test "$n" -eq "$want" || {
+            echo "FAIL: $n oleans, but //lean:pgmigrate has $want sources" >&2
+            exit 1
+          }
+          test "$n" -gt 0 || { echo "FAIL: empty archive" >&2; exit 1; }
+          echo "OK: $n oleans (one per source), no symlinks"
 
   buildifier:
     name: buildifier lint

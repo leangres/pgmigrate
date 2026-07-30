@@ -1,6 +1,6 @@
 module(
     name = "pgmigrate",
-    version = "17.6.0",
+    version = "17.6.1",
 )
 
 # Version tracks the Postgres release modelled. A convention, not enforced —
@@ -12,8 +12,13 @@ bazel_dep(name = "rules_lean", version = "0.6.1")
 # `Fold` folds a parsed DDL stream into a catalog snapshot, so it needs both the
 # catalog model and the parse-tree shapes. This module sits at the top of the
 # leangres graph; everything else is below it.
-bazel_dep(name = "pgcatalog", version = "17.6.1")
+bazel_dep(name = "pgcatalog", version = "17.6.2")
 bazel_dep(name = "pgquery", version = "17.6.0")
+
+# `step` consumes the EMITTER-side `Pg.Stmt.Stmt`, where `Fold` consumes the
+# parser-side `Pg.Query.Top.TopStmt`. Both directions are wanted: `Fold` ingests
+# what Postgres parsed, `step` validates what we are about to emit.
+bazel_dep(name = "pgast", version = "17.6.1")
 
 lake = use_extension("@rules_lean//lean:lake.bzl", "lake")
 lake.workspace(
