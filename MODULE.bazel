@@ -1,6 +1,6 @@
 module(
     name = "pgmigrate",
-    version = "17.6.1",
+    version = "17.6.2",
 )
 
 # Version tracks the Postgres release modelled. A convention, not enforced —
@@ -18,7 +18,7 @@ bazel_dep(name = "pgquery", version = "17.6.0")
 # `step` consumes the EMITTER-side `Pg.Stmt.Stmt`, where `Fold` consumes the
 # parser-side `Pg.Query.Top.TopStmt`. Both directions are wanted: `Fold` ingests
 # what Postgres parsed, `step` validates what we are about to emit.
-bazel_dep(name = "pgast", version = "17.6.1")
+bazel_dep(name = "pgast", version = "17.6.2")
 
 lake = use_extension("@rules_lean//lean:lake.bzl", "lake")
 lake.workspace(

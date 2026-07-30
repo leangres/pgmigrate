@@ -207,6 +207,9 @@ def stmtKeyword : Stmt → String
   | .createPolicy _                 => "CREATE POLICY"
   | .alterTable _                   => "ALTER TABLE"
   | .dropObject _                   => "DROP"
+  | .insert _                       => "INSERT"
+  | .update _                       => "UPDATE"
+  | .delete _                       => "DELETE"
 
 /-! ## Elaboration — every precondition lives here
 
@@ -329,6 +332,17 @@ def elabStmt (s : CatalogState) : Stmt → Except CatalogError (List CatalogEffe
             pure (.addRelation relOid ns.oid.raw (nameOf t.name) :: addCols)
   | .alterTable a => elabAlterTable s a
   | .dropObject d => elabDrop s d
+  -- DML is *identity* on the catalog, not unsupported. The distinction is the
+  -- point: `unsupported` means "we cannot say what this does", whereas these
+  -- three arms are a positive claim that they do nothing a catalog can observe.
+  -- Emitting no effects rather than falling through to the catchall is what
+  -- makes `dml_is_catalog_identity` below provable by `rfl`.
+  --
+  -- This models the CATALOG only. `INSERT` obviously changes the heap, and it
+  -- can fire a trigger that runs DDL. Neither is visible here, and the second
+  -- is a real hole rather than a simplification — see the docstring on
+  -- `dml_is_catalog_identity`.
+  | .insert _ | .update _ | .delete _ => pure []
   | st => throw (.unsupported (stmtKeyword st))
 
 /-- The transition. -/
@@ -347,6 +361,81 @@ def run (s : CatalogState) (sts : List Stmt)
       | .ok s'  => .ok s'
       | .error e => .error (i, e))
     s
+
+/-! ## DML is identity on the catalog
+
+    The first *universally quantified* theorems in this module. Everything else
+    here is checked by `native_decide` over concrete states — true of the states
+    tested and silent about the rest. These three hold for **every** state and
+    **every** statement, and they hold by `rfl`: `elabStmt` emits no effects, and
+    `applyEffects s [] = s` is definitional.
+
+    That is worth having as a theorem rather than a comment because it is the
+    property a migration runner needs in order to *skip* the catalog entirely for
+    a backfill, and because it is the load-bearing half of the DDL/DML split —
+    the catalog transition is partial on DDL and total on DML.
+
+    ⚠ SCOPE, and one of these is a real hole rather than a simplification:
+
+    - The heap is not modelled at all. `INSERT` plainly changes the database; it
+      does not change the *catalog*, which is what `CatalogState` is.
+    - `pg_class.reltuples` / `relpages` DO move on DML in real Postgres, via
+      autovacuum. `Snapshot` does not carry them, so nothing here is wrong, but a
+      differential gate against a live cluster must mask both columns — the same
+      mask the plan already requires for ACLs.
+    - **A DML statement can fire a trigger whose body runs DDL.** Then the
+      catalog does change and these theorems do not describe what happened. They
+      are claims about the statement, not about its trigger closure. Closing that
+      needs `pg_trigger` in the kernel and a reachability check; until then this
+      is a documented hole, not a proved absence. -/
+
+theorem insert_is_catalog_identity (s : CatalogState) (i : Pg.Stmt.InsertStmt) :
+    step s (.insert i) = .ok s := rfl
+
+theorem update_is_catalog_identity (s : CatalogState) (u : Pg.Stmt.UpdateStmt) :
+    step s (.update u) = .ok s := rfl
+
+theorem delete_is_catalog_identity (s : CatalogState) (d : Pg.Stmt.DeleteStmt) :
+    step s (.delete d) = .ok s := rfl
+
+/-- Is this statement DML? Named rather than inlined because the runner wants it
+    too: a script that satisfies this can skip the catalog transition entirely. -/
+def isDml : Stmt → Bool
+  | .insert _ | .update _ | .delete _ => true
+  | _ => false
+
+/-- And so a whole backfill script leaves the catalog untouched — by induction
+    over the list, with the three arms above as the step case. This is the form a
+    migration runner actually consumes.
+
+    The index offset is generalized because `run` folds over `zipIdx`, and the
+    tail of `(st :: rest).zipIdx i` is `rest.zipIdx (i+1)` — so a proof fixed at
+    `0` does not meet its own induction hypothesis. -/
+theorem run_dml_only_is_catalog_identity :
+    ∀ (sts : List Stmt) (s : CatalogState) (n : Nat),
+      sts.all isDml = true →
+      (sts.zipIdx n).foldlM
+        (fun acc (st, i) =>
+          match step acc st with
+          | .ok s'   => Except.ok s'
+          | .error e => Except.error (i, e))
+        s = Except.ok s := by
+  intro sts
+  induction sts with
+  | nil => intro s n _; rfl
+  | cons st rest ih =>
+      intro s n h
+      simp only [List.all_cons, Bool.and_eq_true] at h
+      obtain ⟨hst, hrest⟩ := h
+      match st, hst with
+      | .insert _, _ => simpa using ih s (n + 1) hrest
+      | .update _, _ => simpa using ih s (n + 1) hrest
+      | .delete _, _ => simpa using ih s (n + 1) hrest
+
+/-- The same statement at `run`'s own signature — the one a caller cites. -/
+theorem run_dml_only (s : CatalogState) (sts : List Stmt)
+    (h : sts.all isDml = true) : run s sts = .ok s :=
+  run_dml_only_is_catalog_identity sts s 0 h
 
 /-! ## Projecting the outcome
 
