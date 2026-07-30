@@ -1,5 +1,40 @@
 # Changelog
 
+## 17.6.2 — DML is identity on the catalog, and it is proved
+
+Bumps `pgast` to 17.6.2, which adds top-level `INSERT`/`UPDATE`/`DELETE`.
+
+The exhaustivity lock did its job: `stmtKeyword` stopped compiling the moment
+`Stmt` grew, which is the entire reason it has no catchall.
+
+`elabStmt` now has explicit DML arms emitting **no** effects, rather than letting
+them fall through to `unsupported`. The distinction is the point — `unsupported`
+means "we cannot say what this does", while these arms are a positive claim that
+they do nothing a catalog can observe.
+
+That claim is now a theorem rather than a comment:
+
+    theorem insert_is_catalog_identity (s : CatalogState) (i : InsertStmt) :
+        step s (.insert i) = .ok s := rfl
+
+plus `update`/`delete`, and `run_dml_only` lifting it to whole scripts by
+induction. These are the module's **first universally quantified** results —
+everything else here is `native_decide` over concrete states, true of what was
+tested and silent about the rest. A migration runner can now skip the catalog
+transition for a backfill on a proved basis.
+
+Verified by deliberate break: making the DML arms emit one bogus effect turns
+all of them red (9 errors). They constrain the implementation, which is not
+something to assume of a proof in this codebase.
+
+⚠ Three scope limits, one of which is a real hole rather than a simplification:
+the heap is not modelled (obvious, and not what `CatalogState` is);
+`pg_class.reltuples`/`relpages` do move on DML via autovacuum, so a differential
+gate must mask them; and **a DML statement can fire a trigger whose body runs
+DDL**, in which case the catalog does change and these theorems do not describe
+what happened. They are claims about the statement, not its trigger closure.
+Closing that needs `pg_trigger` in the kernel. Documented, not proved absent.
+
 ## 17.6.1 — a transition that can refuse
 
 `Fold` projects: it folds whatever the parser produced into a catalog, TOTAL,
