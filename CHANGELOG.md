@@ -1,5 +1,36 @@
 # Changelog
 
+## 17.6.3 — CASCADE actually cascades, and pg_depend stops leaking
+
+Two real bugs, both in the drop path.
+
+**`DROP … CASCADE` emitted only the target's drop.** It never dropped the
+dependents — which is the entire meaning of CASCADE. A `DROP TABLE t CASCADE`
+left every view on `t` in the catalog, describing a table that no longer existed.
+Now it emits the full transitive closure (pgcatalog 17.6.4's `cascadeClosure`),
+deepest-first so a dependent is gone before the thing it depends on.
+
+⚠ And it **refuses a non-converged closure** rather than emitting a short one.
+The closure is fuel-bounded because `pg_depend` is a general graph with real
+cycles; a partial cascade that half-drops the schema and reports success is worse
+than a refusal.
+
+**`dropRelation` never cleaned `pg_depend`.** Edges at both ends survived the
+drop, and a stale edge whose referent is gone still counts in `dependentsOf` — so
+a later `DROP … RESTRICT` refused over a dependent that was already dropped,
+naming an object the user cannot find. Both ends are now filtered.
+
+Pinned: RESTRICT still refuses; CASCADE emits three effects for a 3-deep chain,
+not one; drop order is deepest-first; the resulting state holds none of the
+three; dropping the middle view leaves the table; the depend edges are gone; and
+the table is droppable with RESTRICT afterwards — which it would not be if the
+edges had leaked.
+
+⚠ One wart pinned as-emitted rather than fixed: `dependentsExist` names
+`resource`, not `graph.resource`. `nameOf` drops the schema, so an error cannot
+say which schema's `resource` it meant. Qualifying it changes every existing
+error pin, so it is its own change — and this pin makes it visible.
+
 ## 17.6.2 — DML is identity on the catalog, and it is proved
 
 Bumps `pgast` to 17.6.2, which adds top-level `INSERT`/`UPDATE`/`DELETE`.
