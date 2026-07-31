@@ -103,9 +103,17 @@ def applyEffect (s : CatalogState) : CatalogEffect → CatalogState
       -- Dropping a relation takes its constraints and indexes with it. That is
       -- not CASCADE — those rows have no independent existence, and leaving
       -- them would leave the catalog describing constraints on nothing.
+      -- pg_depend edges touching the object go too, at BOTH ends. Leaving them
+      -- was a real leak: a stale edge whose referent no longer exists still
+      -- counts in `dependentsOf`, so a later `DROP … RESTRICT` refuses over a
+      -- dependent that is already gone — an error naming an object the user
+      -- cannot find.
       { s with snap := snap'
              , constraints := s.constraints.filter (fun c => c.conrelid.raw != oid)
-             , indexes     := s.indexes.filter (fun i => i.indrelid.raw != oid) }
+             , indexes     := s.indexes.filter (fun i => i.indrelid.raw != oid)
+             , depends     := s.depends.filter (fun d =>
+                 !(d.classid == .relation && d.objid == oid) &&
+                 !(d.refclassid == .relation && d.refobjid == oid)) }
   | .addAttribute rel name typ attnum notNull =>
       let a : PgAttribute :=
         { attrelid := ⟨rel⟩, attname := name, atttypid := ⟨typ⟩
@@ -309,7 +317,25 @@ def elabDrop (s : CatalogState) (d : DropStmt)
           | .restrict =>
               if deps.isEmpty then pure [.dropRelation rel.oid.raw]
               else throw (.dependentsExist (nameOf n) deps.length)
-          | .cascade => pure [.dropRelation rel.oid.raw]
+          | .cascade =>
+              -- CASCADE means "and everything depending on this, transitively".
+              -- Emitting only the target's drop was a bug that left a view
+              -- behind pointing at a table that no longer existed.
+              --
+              -- ⚠ REFUSE a truncated closure rather than emitting a short one.
+              -- `cascadeClosure` is fuel-bounded (pg_depend is a general graph
+              -- with real cycles), and a partial cascade is worse than none:
+              -- it half-drops the schema and reports success.
+              if !(s.cascadeClosureComplete .relation rel.oid.raw) then
+                throw (.unsupported "DROP CASCADE: dependency closure did not converge")
+              else
+                -- Deepest-first, so a dependent is gone before the thing it
+                -- depends on. `applyEffect` does not care — each drop is
+                -- independent — but the effect list is read by hazard analysis
+                -- and by humans, and drop order is what they expect to see.
+                let closure := (s.cascadeClosure .relation rel.oid.raw).reverse
+                pure (closure.filterMap fun (k, o) =>
+                  if k == .relation then some (CatalogEffect.dropRelation o) else none)
   | t => throw (.unsupported ("DROP " ++ t.keyword))
 
 /-- Apply one statement. -/

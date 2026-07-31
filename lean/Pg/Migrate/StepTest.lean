@@ -147,4 +147,83 @@ example :
     ).toOption.map colsOf = some (some ["id", "kind", "removed_at"]) := by
   native_decide
 
+
+/-! ## DROP … CASCADE takes the dependents with it
+
+    It previously emitted ONLY the target's drop, which left a view behind
+    pointing at a table that no longer existed. These pin the closure. -/
+
+private def graphNs : Nat := 16384
+
+/-- `graph.resource` ← `graph.v_resource` ← `graph.v_summary`. -/
+private def withViews : CatalogState :=
+  { CatalogState.empty with
+    snap := { CatalogState.empty.snap with
+      namespaces := CatalogState.empty.snap.namespaces ++
+        [{ oid := ⟨graphNs⟩, nspname := "graph" }]
+      relations := [
+        { oid := ⟨16400⟩, relname := "resource",   relnamespace := ⟨graphNs⟩
+        , relkind := .ordinaryTable, reltype := ⟨16410⟩ }
+      , { oid := ⟨16401⟩, relname := "v_resource", relnamespace := ⟨graphNs⟩
+        , relkind := .view, reltype := ⟨16411⟩ }
+      , { oid := ⟨16402⟩, relname := "v_summary",  relnamespace := ⟨graphNs⟩
+        , relkind := .view, reltype := ⟨16412⟩ }] }
+    depends := [
+      { classid := .relation, objid := 16401
+      , refclassid := .relation, refobjid := 16400, deptype := .normal }
+    , { classid := .relation, objid := 16402
+      , refclassid := .relation, refobjid := 16401, deptype := .normal } ] }
+
+private def dropResource (b : DropBehavior) : Stmt :=
+  .dropObject { target := .table (Identifier.qualified "graph" "resource"), behavior := b }
+
+/-- RESTRICT still refuses — the direct dependent is enough.
+
+    ⚠ Pinned as EMITTED: the error names `resource`, not `graph.resource`, even
+    though the statement was qualified. `nameOf` drops the schema. That is a real
+    wart — two schemas can each hold a `resource` and the message would not say
+    which — but qualifying it changes every existing error pin, so it is its own
+    change. This pin is what makes that change visible when someone makes it. -/
+example : errorOf (step withViews (dropResource .restrict))
+    = some (.dependentsExist "resource" 1) := by
+  native_decide
+
+/-- CASCADE emits a drop for EVERY object in the closure, not just the target.
+    Three, not one: this is the pin that fails on the old behaviour. -/
+example : (elabStmt withViews (dropResource .cascade)).toOption.map (·.length)
+    = some 3 := by native_decide
+
+/-- Deepest-first, so a dependent is gone before the thing it depends on. -/
+example : (elabStmt withViews (dropResource .cascade)).toOption
+    = some [.dropRelation 16402, .dropRelation 16401, .dropRelation 16400] := by
+  native_decide
+
+/-- And the resulting state has none of the three. The old behaviour left two
+    views describing a table that no longer existed. -/
+example : (step withViews (dropResource .cascade)).toOption.map
+    (fun s => s.snap.relations.length) = some 0 := by native_decide
+
+/-- Dropping the MIDDLE view takes only what sits on it, leaving the table. -/
+private def dropView : Stmt :=
+  .dropObject { target := .table (Identifier.qualified "graph" "v_resource")
+              , behavior := .cascade }
+
+example : (step withViews dropView).toOption.map
+    (fun s => s.snap.relations.map (fun r => r.relname)) = some ["resource"] := by
+  native_decide
+
+/-! ## pg_depend does not leak on a drop
+
+    A stale edge whose referent is gone still counts in `dependentsOf`, so a
+    later RESTRICT refuses over a dependent the user cannot find. -/
+
+example : (step withViews dropView).toOption.map (fun s => s.depends.length)
+    = some 0 := by native_decide
+
+/-- Which means the table is then droppable with RESTRICT — it was not before,
+    and would still not be if the edges had leaked. -/
+example : ((step withViews dropView).toOption.map
+    (fun s => errorOf (step s (dropResource .restrict)))) = some none := by
+  native_decide
+
 end Pg.Migrate.StepTest
